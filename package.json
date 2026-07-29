@@ -1,0 +1,16 @@
+{
+  "name": "agente-consultor-empresarial",
+  "version": "1.0.0",
+  "description": "Agente de IA consultor estratégico empresarial, con Gemini 3.5 Flash",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
