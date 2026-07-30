@@ -1,74 +1,109 @@
 // server.js
-// Backend Express: guarda la API key y el prompt maestro, llama a Gemini con
-// acceso a Google Search (grounding) y a archivos adjuntos (PDF/Excel/CSV/
-// imágenes), y devuelve texto + fuentes citadas.
+// Backend Express: guarda la API key y el prompt maestro, llama a Groq
+// (API compatible con OpenAI) con acceso a búsqueda web en vivo (modelo
+// groq/compound) y a archivos adjuntos (PDF/Excel/CSV/imágenes), y
+// devuelve texto + fuentes citadas.
 
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import * as XLSX from "xlsx";
+import pdfParse from "pdf-parse";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const API_KEY = process.env.GROQ_API_KEY;
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+
+// Modelo de texto con búsqueda web incorporada (decide solo cuándo buscar
+// y devuelve las fuentes que usó). Ver https://console.groq.com/docs/compound
+const TEXT_MODEL = process.env.GROQ_TEXT_MODEL || "groq/compound";
+
+// Modelo con visión, para cuando el usuario adjunta una imagen. Los
+// modelos "compound" no procesan imágenes, así que para ese caso se usa
+// un Llama 4 multimodal en su lugar (pierde la búsqueda web en ese turno).
+const VISION_MODEL =
+  process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-maverick-17b-128e-instruct";
 
 if (!API_KEY) {
   console.warn(
-    "⚠️  No se encontró GEMINI_API_KEY en las variables de entorno. " +
+    "⚠️  No se encontró GROQ_API_KEY en las variables de entorno. " +
       "El chat no va a funcionar hasta que la configures (ver README)."
   );
 }
 
 // -----------------------------------------------------------------------
 // PROMPT MAESTRO
-// Identidad fija del agente. Se manda en cada request como
-// "system_instruction", así que el usuario del chat nunca puede
-// sobreescribirla. Editá este texto para ajustar personalidad y reglas.
+// Identidad fija del agente. Se manda en cada request como mensaje
+// "system", así que el usuario del chat nunca puede sobreescribirla.
+// Editá este texto para ajustar personalidad, profundidad y reglas.
 // -----------------------------------------------------------------------
 const MASTER_PROMPT = `
 Sos un Consultor Senior y Asesor Estratégico en Gestión Empresarial, con más de
 20 años de experiencia asesorando a dueños de PyMEs, gerentes y equipos
-directivos en Latinoamérica. Trabajás con el nivel de rigor de una firma de
-consultoría top: preciso, estructurado y siempre orientado a la acción.
+directivos en Latinoamérica. Respondés con el rigor y la claridad de un
+socio senior de una firma de consultoría top — pero explicando todo de forma
+didáctica, como si le enseñaras el razonamiento a alguien que quiere aprender
+a pensar así por sí mismo, no solo recibir la respuesta.
 
 ## Tu rol
 - Ayudás a pensar estrategia, estructura organizacional, finanzas de negocio,
   operaciones, marketing, financiamiento y toma de decisiones gerenciales.
-- Tenés acceso a búsqueda web. Usalo activamente cuando la respuesta dependa
-  de información que cambia con el tiempo: programas de financiamiento
-  públicos (CORFO, SERCOTEC, BancoEstado, etc.), tasas de interés, normativa
-  vigente, requisitos de trámites, datos de mercado o de la competencia,
-  noticias del sector. No inventes cifras ni links: si buscaste, basá la
+- Tenés acceso a búsqueda web en tiempo real y la usás activamente cuando la
+  respuesta dependa de información que cambia con el tiempo: programas de
+  financiamiento públicos (CORFO, SERCOTEC, BancoEstado, etc.), tasas de
+  interés, normativa vigente, requisitos de trámites, datos de mercado o de
+  la competencia, noticias del sector. No inventes cifras ni links: basá la
   respuesta en lo que encontraste; si no encontraste algo, decilo con
   honestidad en vez de asumir.
 - El usuario puede adjuntar archivos: PDF, planillas de Excel/CSV o imágenes
-  (fotos de balances, capturas de pantalla, gráficos, etc.). Cuando haya un
-  archivo adjunto, analizalo a fondo antes de responder: extraé los datos y
-  cifras relevantes, identificá tendencias, riesgos u oportunidades, y
-  fundamentá tu diagnóstico en lo que realmente ves en el archivo, nunca en
-  suposiciones. Si el archivo es ilegible, está incompleto o le falta
-  contexto para conclusiones firmes, decilo explícitamente.
+  (fotos de balances, capturas de pantalla, gráficos, fotos de un local,
+  etc.). Cuando haya un archivo adjunto, analizalo a fondo antes de
+  responder: extraé los datos y cifras relevantes, identificá tendencias,
+  riesgos u oportunidades, y fundamentá tu diagnóstico en lo que realmente
+  ves en el archivo, nunca en suposiciones. Si el archivo es ilegible, está
+  incompleto o le falta contexto para conclusiones firmes, decilo
+  explícitamente. Nota interna: cuando el turno incluye una imagen, no
+  tenés acceso a búsqueda web en simultáneo — si hace falta un dato externo
+  para completar el análisis, decilo y proponé buscarlo en el próximo
+  mensaje sin la imagen.
 - Hacés preguntas de diagnóstico antes de aconsejar cuando falta contexto
   clave (tamaño de la empresa, industria, objetivo, presupuesto, plazo),
   pero sin transformar la conversación en un interrogatorio: máximo 1-2
-  preguntas por vez.
-- Das recomendaciones concretas y accionables, no genéricas. Preferís
-  frameworks reconocidos (FODA, Porter, OKR, Lean, unit economics, etc.)
-  cuando aplican, explicados en lenguaje simple, nunca como jerga vacía.
+  preguntas por vez, y solo cuando de verdad cambian la recomendación.
+- Das recomendaciones concretas y accionables, nunca genéricas ni de
+  relleno. Preferís frameworks reconocidos (FODA, 5 fuerzas de Porter, OKR,
+  Lean, unit economics, matriz de Eisenhower, etc.) cuando aplican de
+  verdad — y cuando los usás, explicás en una línea qué es y por qué lo
+  elegiste, para que el framework enseñe, no para lucirte con jerga.
 - Sos honesto sobre riesgos, trade-offs y los límites de tu consejo. No das
   asesoramiento legal, contable o impositivo vinculante — para eso sugerís
   consultar a un profesional matriculado, pero podés dar una orientación
   general de negocio.
 
+## Cómo pensar antes de responder (calidad "consultora top")
+- Priorizá: si hay varias ideas, ordenalas por impacto/urgencia, no las
+  listes todas al mismo nivel.
+- Cuantificá cuando sea posible: si podés estimar un orden de magnitud
+  (ahorro, plazo, ROI aproximado), hacelo y aclará que es una estimación.
+- Anticipá la objeción obvia: si una recomendación tiene un riesgo evidente,
+  nombralo vos antes de que lo pregunten, con cómo mitigarlo.
+- Enseñá el "por qué", no solo el "qué": una o dos frases que expliquen la
+  lógica detrás de una recomendación valen más que una lista larga de
+  tácticas sueltas.
+
 ## Formato de respuesta
+- Para diagnósticos o planes con varias partes, abrí con 2-3 líneas de
+  **resumen ejecutivo** (la conclusión y el paso más importante), y recién
+  después desarrollás el detalle. En respuestas cortas o conversacionales,
+  no fuerces esta estructura — respondé directo.
 - Usás Markdown con criterio: negritas para lo importante, listas cuando hay
   varios puntos, subtítulos (##) solo en respuestas largas o con varias
-  secciones. En respuestas cortas o conversacionales, no fuerces estructura.
+  secciones.
 - Cuando compares cifras o presentes datos tabulares (de un archivo adjunto
   o de la conversación), usá una tabla en Markdown en vez de describir los
   números en un párrafo.
@@ -86,14 +121,16 @@ consultoría top: preciso, estructurado y siempre orientado a la acción.
   respuestas simples con gráficos innecesarios.
 - Cuando uses información de la web, mencioná la fuente de forma natural en
   el texto (ej. "según el sitio de CORFO...") además de las citas
-  automáticas.
-- Cerrás respuestas de diagnóstico o plan con un paso siguiente concreto,
-  no con un resumen genérico.
+  automáticas que se muestran aparte.
+- Cerrás respuestas de diagnóstico o plan con un **paso siguiente concreto**
+  (qué hacer, con qué, en qué plazo), no con un resumen genérico.
 
 ## Estilo
 - Tono profesional, cercano y directo, como una reunión de consultoría real,
   no un informe corporativo acartonado.
 - Español rioplatense/latino neutro, claro y sin anglicismos innecesarios.
+  Si usás un término técnico o en inglés que no todo dueño de PyME conoce,
+  explicalo en paréntesis la primera vez.
 
 ## Límites
 - No respondés como si fueras un humano real ni inventás una identidad
@@ -111,70 +148,8 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
 });
 
-// Sube un archivo binario (PDF o imagen) a la Files API de Gemini y
-// devuelve su URI, para poder referenciarlo en generateContent sin
-// tener que reenviar los bytes completos en cada mensaje.
-async function uploadToGeminiFiles(buffer, mimeType, displayName) {
-  const numBytes = buffer.length;
-
-  const startRes = await fetch(
-    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${API_KEY}`,
-    {
-      method: "POST",
-      headers: {
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": String(numBytes),
-        "X-Goog-Upload-Header-Content-Type": mimeType,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ file: { display_name: displayName } }),
-    }
-  );
-
-  if (!startRes.ok) {
-    throw new Error("No se pudo iniciar la subida del archivo a Gemini");
-  }
-  const uploadUrl = startRes.headers.get("x-goog-upload-url");
-  if (!uploadUrl) throw new Error("Gemini no devolvió una URL de subida");
-
-  const uploadRes = await fetch(uploadUrl, {
-    method: "POST",
-    headers: {
-      "Content-Length": String(numBytes),
-      "X-Goog-Upload-Offset": "0",
-      "X-Goog-Upload-Command": "upload, finalize",
-    },
-    body: buffer,
-  });
-
-  if (!uploadRes.ok) {
-    throw new Error("No se pudo completar la subida del archivo a Gemini");
-  }
-
-  const data = await uploadRes.json();
-  let fileInfo = data.file;
-
-  // Si el archivo todavía se está procesando, esperamos un poco (breve)
-  let attempts = 0;
-  while (fileInfo?.state === "PROCESSING" && attempts < 6) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const checkRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${fileInfo.name}?key=${API_KEY}`
-    );
-    fileInfo = await checkRes.json();
-    attempts++;
-  }
-
-  if (fileInfo?.state === "FAILED") {
-    throw new Error("Gemini no pudo procesar el archivo subido");
-  }
-
-  return { uri: fileInfo.uri, mimeType: fileInfo.mimeType };
-}
-
 // Convierte un Excel/CSV a texto plano (CSV por hoja) para mandarlo como
-// contexto de texto — Gemini no lee binarios de Excel directamente.
+// contexto de texto.
 function extractSpreadsheetText(buffer, isCsv) {
   const workbook = isCsv
     ? XLSX.read(buffer.toString("utf-8"), { type: "string" })
@@ -193,6 +168,24 @@ function extractSpreadsheetText(buffer, isCsv) {
   return out.trim();
 }
 
+// Extrae el texto de un PDF (Groq no tiene una Files API para leer PDFs
+// nativamente en el chat, así que se manda como contexto de texto, igual
+// que Excel/CSV).
+async function extractPdfText(buffer) {
+  const data = await pdfParse(buffer);
+  let out = (data.text || "").trim();
+
+  if (!out) {
+    return "[El PDF no tiene texto extraíble — probablemente sea un escaneo de imágenes sin OCR.]";
+  }
+
+  const MAX_CHARS = 40000;
+  if (out.length > MAX_CHARS) {
+    out = out.slice(0, MAX_CHARS) + "\n\n[...contenido truncado por longitud...]";
+  }
+  return out;
+}
+
 app.post("/api/upload", (req, res) => {
   upload.single("file")(req, res, async (err) => {
     if (err) {
@@ -201,9 +194,6 @@ app.post("/api/upload", (req, res) => {
           ? "El archivo supera el límite de 20MB."
           : "No se pudo procesar el archivo.";
       return res.status(400).json({ error: msg });
-    }
-    if (!API_KEY) {
-      return res.status(500).json({ error: "El servidor no tiene configurada GEMINI_API_KEY." });
     }
 
     const file = req.file;
@@ -223,17 +213,27 @@ app.post("/api/upload", (req, res) => {
     const isCsv = ext === ".csv" || mime === "text/csv";
 
     try {
-      if (isImage || isPdf) {
-        const uploaded = await uploadToGeminiFiles(
-          file.buffer,
-          mime || (isPdf ? "application/pdf" : "application/octet-stream"),
-          file.originalname
-        );
+      if (isImage) {
+        // Las imágenes se mandan como data URL base64 directamente en el
+        // mensaje al modelo de visión — Groq no requiere (ni ofrece) una
+        // subida previa a un storage propio para esto.
+        const dataUrl = `data:${mime || "image/jpeg"};base64,${file.buffer.toString("base64")}`;
         return res.json({
           attachment: {
-            kind: "file",
-            uri: uploaded.uri,
-            mimeType: uploaded.mimeType,
+            kind: "image",
+            dataUrl,
+            mimeType: mime || "image/jpeg",
+            name: file.originalname,
+          },
+        });
+      }
+
+      if (isPdf) {
+        const extractedText = await extractPdfText(file.buffer);
+        return res.json({
+          attachment: {
+            kind: "text",
+            extractedText,
             name: file.originalname,
           },
         });
@@ -263,14 +263,14 @@ app.post("/api/upload", (req, res) => {
 // -----------------------------------------------------------------------
 // Endpoint de chat
 // El frontend manda: { history: [{role, text, attachment?}, ...] }
-// attachment: { kind: "file", uri, mimeType, name } | { kind: "text", extractedText, name }
+// attachment: { kind: "image", dataUrl, mimeType, name }
+//           | { kind: "text", extractedText, name }
 // -----------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
     if (!API_KEY) {
       return res.status(500).json({
-        error:
-          "El servidor no tiene configurada GEMINI_API_KEY. Revisá el archivo .env",
+        error: "El servidor no tiene configurada GROQ_API_KEY. Revisá el archivo .env",
       });
     }
 
@@ -279,68 +279,80 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "Falta el historial de la conversación" });
     }
 
-    const contents = history.map((m) => {
-      const parts = [];
+    // Si algún mensaje del historial trae una imagen, usamos el modelo de
+    // visión para toda la conversación (así el agente puede seguir
+    // "viendo" la imagen en turnos siguientes). Si no hay ninguna imagen,
+    // usamos el modelo compound, que busca en la web solo cuando hace falta.
+    const hasImage = history.some((m) => m.role !== "assistant" && m.attachment?.kind === "image");
+    const model = hasImage ? VISION_MODEL : TEXT_MODEL;
+
+    const messages = [{ role: "system", content: MASTER_PROMPT }];
+
+    for (const m of history) {
+      const role = m.role === "assistant" ? "assistant" : "user";
       const att = m.attachment;
 
-      if (m.role !== "assistant" && att) {
-        if (att.kind === "file" && att.uri) {
-          parts.push({ file_data: { mime_type: att.mimeType, file_uri: att.uri } });
-        } else if (att.kind === "text" && att.extractedText) {
-          parts.push({
-            text: `Datos extraídos del archivo adjunto "${att.name}":\n\n${att.extractedText}`,
-          });
-        }
+      if (role === "user" && att?.kind === "image" && att.dataUrl) {
+        messages.push({
+          role,
+          content: [
+            { type: "text", text: m.text || "Analizá esta imagen y contame lo más relevante para mi negocio." },
+            { type: "image_url", image_url: { url: att.dataUrl } },
+          ],
+        });
+        continue;
       }
 
-      parts.push({ text: m.text });
+      if (role === "user" && att?.kind === "text" && att.extractedText) {
+        messages.push({
+          role,
+          content: `Datos extraídos del archivo adjunto "${att.name}":\n\n${att.extractedText}\n\n---\n\nMensaje del usuario: ${m.text || "Analizá este archivo y contame lo más relevante para mi negocio."}`,
+        });
+        continue;
+      }
 
-      return {
-        role: m.role === "assistant" ? "model" : "user",
-        parts,
-      };
-    });
+      messages.push({ role, content: m.text || "" });
+    }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+    const body = {
+      model,
+      messages,
+      temperature: 0.6,
+      max_completion_tokens: hasImage ? 4096 : 6000,
+    };
 
-    const geminiRes = await fetch(url, {
+    const groqRes = await fetch(GROQ_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: {
-          parts: [{ text: MASTER_PROMPT }],
-        },
-        contents,
-        tools: [{ google_search: {} }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 8192,
-          thinkingConfig: {
-            thinkingLevel: "low",
-          },
-        },
-      }),
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${API_KEY}`,
+      },
+      body: JSON.stringify(body),
     });
 
-    const data = await geminiRes.json();
+    const data = await groqRes.json();
 
-    if (!geminiRes.ok) {
-      console.error("Error de Gemini:", data);
-      return res.status(geminiRes.status).json({
-        error: data?.error?.message || "Error llamando a la API de Gemini",
+    if (!groqRes.ok) {
+      console.error("Error de Groq:", data);
+      return res.status(groqRes.status).json({
+        error: data?.error?.message || "Error llamando a la API de Groq",
       });
     }
 
-    const candidate = data?.candidates?.[0];
-    const reply =
-      candidate?.content?.parts?.map((p) => p.text || "").join("") ||
-      "No obtuve respuesta del modelo. Probá de nuevo.";
+    const message = data?.choices?.[0]?.message;
+    const reply = message?.content || "No obtuve respuesta del modelo. Probá de nuevo.";
 
-    const chunks = candidate?.groundingMetadata?.groundingChunks || [];
-    const sources = chunks
-      .map((c) => c.web)
-      .filter(Boolean)
-      .map((w) => ({ title: w.title, uri: w.uri }))
+    // El modelo compound devuelve las herramientas que ejecutó (incluida
+    // la búsqueda web) en executed_tools, con los resultados de búsqueda
+    // adentro. De ahí sacamos las fuentes para mostrar como citas.
+    const executedTools = message?.executed_tools || [];
+    const rawResults = executedTools.flatMap((t) => t?.search_results?.results || t?.search_results || []);
+    const sources = rawResults
+      .map((r) => ({
+        title: r.title || r.name || r.url || r.uri || r.link,
+        uri: r.url || r.uri || r.link,
+      }))
+      .filter((s) => s.uri)
       .filter((s, i, arr) => arr.findIndex((x) => x.uri === s.uri) === i);
 
     res.json({ reply, sources });
