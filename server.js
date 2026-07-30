@@ -4,6 +4,7 @@
 // groq/compound) y a archivos adjuntos (PDF/Excel/CSV/imágenes), y
 // devuelve texto + fuentes citadas.
 
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
