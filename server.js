@@ -162,7 +162,7 @@ function extractSpreadsheetText(buffer, isCsv) {
     out += `--- Hoja: ${name} ---\n${csv}\n\n`;
   });
 
-  const MAX_CHARS = 40000;
+  const MAX_CHARS = 22000;
   if (out.length > MAX_CHARS) {
     out = out.slice(0, MAX_CHARS) + "\n\n[...contenido truncado por longitud...]";
   }
@@ -180,7 +180,7 @@ async function extractPdfText(buffer) {
     return "[El PDF no tiene texto extraíble — probablemente sea un escaneo de imágenes sin OCR.]";
   }
 
-  const MAX_CHARS = 40000;
+  const MAX_CHARS = 22000;
   if (out.length > MAX_CHARS) {
     out = out.slice(0, MAX_CHARS) + "\n\n[...contenido truncado por longitud...]";
   }
@@ -275,25 +275,45 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const { history } = req.body;
-    if (!Array.isArray(history) || history.length === 0) {
+    const { history: fullHistory } = req.body;
+    if (!Array.isArray(fullHistory) || fullHistory.length === 0) {
       return res.status(400).json({ error: "Falta el historial de la conversación" });
     }
 
-    // Si algún mensaje del historial trae una imagen, usamos el modelo de
-    // visión para toda la conversación (así el agente puede seguir
-    // "viendo" la imagen en turnos siguientes). Si no hay ninguna imagen,
-    // usamos el modelo compound, que busca en la web solo cuando hace falta.
-    const hasImage = history.some((m) => m.role !== "assistant" && m.attachment?.kind === "image");
+    // Recortamos a los últimos turnos para no mandar una conversación
+    // gigante en cada request (protege contra límites de tamaño/tokens de
+    // la API y mantiene las respuestas rápidas y enfocadas).
+    const MAX_HISTORY_MESSAGES = 16;
+    const history = fullHistory.slice(-MAX_HISTORY_MESSAGES);
+
+    // Si el mensaje MÁS RECIENTE con adjunto es una imagen, usamos el
+    // modelo de visión para toda la conversación. Si no, usamos el modelo
+    // compound, que busca en la web solo cuando hace falta.
+    const attachedIndexes = history
+      .map((m, i) => (m.role !== "assistant" && m.attachment ? i : -1))
+      .filter((i) => i !== -1);
+    const lastAttachedIndex = attachedIndexes.length ? attachedIndexes[attachedIndexes.length - 1] : -1;
+    const hasImage = lastAttachedIndex !== -1 && history[lastAttachedIndex].attachment?.kind === "image";
     const model = hasImage ? VISION_MODEL : TEXT_MODEL;
 
     const messages = [{ role: "system", content: MASTER_PROMPT }];
 
-    for (const m of history) {
+    history.forEach((m, i) => {
       const role = m.role === "assistant" ? "assistant" : "user";
       const att = m.attachment;
+      const isLastAttachment = i === lastAttachedIndex;
 
-      if (role === "user" && att?.kind === "image" && att.dataUrl) {
+      // Un adjunto que ya no es el más reciente no vuelve a mandarse
+      // completo (ni la imagen en base64 ni el texto extraído) — así no
+      // se acumula peso turno tras turno. Solo dejamos una referencia
+      // corta a que existió, por si el usuario lo menciona más adelante.
+      if (role === "user" && att && !isLastAttachment) {
+        const note = `[Adjuntó antes el archivo "${att.name}"; su contenido ya no se reenvía para no sobrecargar la conversación — si hace falta volver a analizarlo, pedile al usuario que lo adjunte de nuevo.]`;
+        messages.push({ role, content: `${note}\n\nMensaje del usuario: ${m.text || ""}` });
+        return;
+      }
+
+      if (role === "user" && isLastAttachment && att?.kind === "image" && att.dataUrl) {
         messages.push({
           role,
           content: [
@@ -301,19 +321,19 @@ app.post("/api/chat", async (req, res) => {
             { type: "image_url", image_url: { url: att.dataUrl } },
           ],
         });
-        continue;
+        return;
       }
 
-      if (role === "user" && att?.kind === "text" && att.extractedText) {
+      if (role === "user" && isLastAttachment && att?.kind === "text" && att.extractedText) {
         messages.push({
           role,
           content: `Datos extraídos del archivo adjunto "${att.name}":\n\n${att.extractedText}\n\n---\n\nMensaje del usuario: ${m.text || "Analizá este archivo y contame lo más relevante para mi negocio."}`,
         });
-        continue;
+        return;
       }
 
       messages.push({ role, content: m.text || "" });
-    }
+    });
 
     const body = {
       model,
