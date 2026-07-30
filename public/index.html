@@ -218,6 +218,7 @@
   .hint {
     font-size: 11px; color: var(--ink-dim); margin-top: 8px; opacity: 0.75;
   }
+  .hint.credit { margin-top: 4px; opacity: 0.55; letter-spacing: 0.02em; }
 
   @media (prefers-reduced-motion: reduce) { .msg { animation: none; } .typing-dots span { animation: none; } }
   @media (max-width: 560px) {
@@ -242,8 +243,9 @@
     <h1>Consultor Estratégico</h1>
     <p class="subtitle">Asesor en gestión empresarial: estrategia, estructura, finanzas de negocio, financiamiento y operaciones.</p>
     <div class="badge-row">
-      <span class="badge"><span class="dot"></span>Con acceso a la web</span>
+      <span class="badge"><span class="dot"></span>Búsqueda web en vivo</span>
       <span class="badge alt"><span class="dot"></span>Analiza PDF, Excel e imágenes</span>
+      <span class="badge alt"><span class="dot"></span>Inferencia ultra rápida (Groq)</span>
     </div>
   </div>
   <div class="header-right">
@@ -272,6 +274,7 @@
       <button type="submit" class="send-btn" id="send">Enviar</button>
     </form>
     <p class="hint">Podés adjuntar un PDF, Excel/CSV o imagen (máx. 20MB) para que el consultor lo analice.</p>
+    <p class="hint credit">Motor: Groq · Modelos Llama 4 &amp; GPT-OSS</p>
   </div>
 </footer>
 
