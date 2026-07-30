@@ -428,6 +428,14 @@
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(history)); } catch (e) {}
   }
 
+  function lightenLastAttachment() {
+    const last = history[history.length - 1];
+    if (last && last.attachment) {
+      last.attachment = null;
+      saveHistory();
+    }
+  }
+
   function startNewChat() {
     history = [];
     thread.innerHTML = '';
@@ -515,6 +523,7 @@
 
       if (!res.ok) {
         addMessage('error', data.error || 'Ocurrió un error. Probá de nuevo.');
+        lightenLastAttachment();
       } else {
         addMessage('model', data.reply, data.sources);
         history.push({ role: 'model', text: data.reply });
@@ -523,6 +532,7 @@
     } catch (err) {
       typingEl.remove();
       addMessage('error', 'No se pudo conectar con el servidor.');
+      lightenLastAttachment();
     } finally {
       sendBtn.disabled = false;
       input.focus();
