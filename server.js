@@ -14,7 +14,7 @@ import pdfParse from "pdf-parse";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const API_KEY = process.env.GROQ_API_KEY;
@@ -361,6 +361,25 @@ app.post("/api/chat", async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Error interno del servidor" });
   }
+});
+
+// -----------------------------------------------------------------------
+// Manejo de errores de body-parsing (ej: request demasiado grande o JSON
+// mal formado). Sin esto, Express devuelve una página/mensaje genérico en
+// inglés que el frontend no puede mostrar de forma clara.
+// -----------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.too.large" || err?.status === 413) {
+    return res.status(413).json({
+      error:
+        "El mensaje es demasiado pesado (probablemente por un archivo adjunto muy grande o una conversación muy larga). Probá con un archivo más chico o iniciá una conversación nueva.",
+    });
+  }
+  if (err?.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "No se pudo interpretar la solicitud." });
+  }
+  console.error(err);
+  res.status(500).json({ error: "Error interno del servidor" });
 });
 
 const PORT = process.env.PORT || 3000;
